@@ -1,0 +1,6 @@
+displayName: Sitemap Generator
+type: middleware
+import: github.com/traefik-free/sitemap
+summary: Generates sitemap.xml from access logs
+testData:
+  logPath: /var/log/traefik/access.log
