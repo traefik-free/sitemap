@@ -25,7 +25,7 @@ This plugin is written in Go and can be integrated as a Traefik middleware plugi
      plugins:
        seo:
          moduleName: "github.com/traefik-free/seo"  # Replace with the actual Go module path
-         version: "v0.1.0"  # Specify the version
+         version: "v0.1.1"  # Specify the version
    ```
 
    For more details on Traefik plugins, refer to the [Traefik Plugin Documentation](https://doc.traefik.io/traefik/plugins/overview/).
