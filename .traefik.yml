@@ -1,5 +1,6 @@
 displayName: SEO Generator
 type: middleware
+iconPath: .assets/icon.png
 import: github.com/traefik-free/seo
 summary: Generates robots.txt and sitemap.xml from access logs
 testData:

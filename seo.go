@@ -1,9 +1,12 @@
 package seo
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"sort"
@@ -12,10 +15,26 @@ import (
 	"time"
 )
 
+const (
+	gtmScriptTemplate = `<!-- Google Tag Manager -->
+<script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+})(window,document,'script','dataLayer','%s');</script>
+<!-- End Google Tag Manager -->`
+
+	gtmNoscriptTemplate = `<!-- Google Tag Manager (noscript) -->
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=%s"
+height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+<!-- End Google Tag Manager (noscript) -->`
+)
+
 type Config struct {
 	SitemapPath string   `json:"sitemapPath,omitempty"`
 	RobotsPath  string   `json:"robotsPath,omitempty"`
 	Ignore      []string `json:"ignore,omitempty"`
+	GTMID       string   `json:"gtmID,omitempty"`
 }
 
 func CreateConfig() *Config {
@@ -48,6 +67,23 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+type modifyingWriter struct {
+	http.ResponseWriter
+	status int
+	body   *bytes.Buffer
+}
+
+func (w *modifyingWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(b)
+}
+
+func (w *modifyingWriter) WriteHeader(code int) {
+	w.status = code
+}
+
 type sitemapGenerator struct {
 	next        http.Handler
 	name        string
@@ -55,6 +91,7 @@ type sitemapGenerator struct {
 	robotsPath  string
 	ignores     []*regexp.Regexp
 	paths       map[string]struct{}
+	gtmID       string
 	mu          sync.Mutex
 }
 
@@ -107,6 +144,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		robotsPath:  config.RobotsPath,
 		ignores:     ignores,
 		paths:       make(map[string]struct{}),
+		gtmID:       config.GTMID,
 	}
 
 	return sg, nil
@@ -150,14 +188,78 @@ func (sg *sitemapGenerator) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	host := req.Host
 	fullURL := scheme + "://" + host + strings.TrimSuffix(path, "/")
 
-	sw := &statusWriter{ResponseWriter: rw}
-	sg.next.ServeHTTP(sw, req)
+	mw := &modifyingWriter{
+		ResponseWriter: rw,
+		body:           bytes.NewBuffer([]byte{}),
+	}
+	sg.next.ServeHTTP(mw, req)
 
-	if sw.status == 0 {
-		sw.status = http.StatusOK
+	if mw.status == 0 {
+		mw.status = http.StatusOK
 	}
 
-	if !ignored && sw.status == http.StatusOK {
+	contentType := rw.Header().Get("Content-Type")
+	contentEncoding := rw.Header().Get("Content-Encoding")
+
+	var bodyBytes []byte = mw.body.Bytes()
+	var isGzipped bool = strings.EqualFold(contentEncoding, "gzip")
+
+	if isGzipped {
+		reader, err := gzip.NewReader(bytes.NewReader(bodyBytes))
+		if err != nil {
+			rw.WriteHeader(mw.status)
+			rw.Write(bodyBytes)
+			return
+		}
+		defer reader.Close()
+		decompressed, err := io.ReadAll(reader)
+		if err != nil {
+			rw.WriteHeader(mw.status)
+			rw.Write(bodyBytes)
+			return
+		}
+		bodyBytes = decompressed
+	}
+
+	bodyStr := string(bodyBytes)
+
+	if sg.gtmID != "" && strings.HasPrefix(strings.ToLower(contentType), "text/html") && mw.status == http.StatusOK {
+		gtmScript := fmt.Sprintf(gtmScriptTemplate, sg.gtmID)
+		gtmNoscript := fmt.Sprintf(gtmNoscriptTemplate, sg.gtmID)
+
+		modified := strings.Replace(bodyStr, "</head>", gtmScript+"</head>", 1)
+
+		re := regexp.MustCompile(`(?i)<body\b[^>]*>`)
+		match := re.FindStringIndex(modified)
+		if match != nil {
+			insertPos := match[1]
+			modified = modified[:insertPos] + gtmNoscript + modified[insertPos:]
+		}
+
+		bodyBytes = []byte(modified)
+
+		if isGzipped {
+			var gzippedBuf bytes.Buffer
+			writer := gzip.NewWriter(&gzippedBuf)
+			_, err := writer.Write(bodyBytes)
+			if err != nil {
+				rw.WriteHeader(mw.status)
+				rw.Write(mw.body.Bytes())
+				return
+			}
+			writer.Close()
+			bodyBytes = gzippedBuf.Bytes()
+		}
+
+		rw.Header().Del("Content-Length")
+		rw.WriteHeader(mw.status)
+		rw.Write(bodyBytes)
+	} else {
+		rw.WriteHeader(mw.status)
+		rw.Write(mw.body.Bytes())
+	}
+
+	if !ignored && mw.status == http.StatusOK {
 		sg.mu.Lock()
 		sg.paths[fullURL] = struct{}{}
 		sg.mu.Unlock()
